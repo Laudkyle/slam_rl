@@ -78,7 +78,7 @@ except Exception:
     fps = 30.0
     
     
-# DEPTH ESTIMATION & OCCUPANCY GRIDS
+# depth estimation
 class MiDaSDepthEstimator:
     def __init__(self, device='cuda', model_type='DPT_Large'):
         self.device = device
@@ -145,3 +145,101 @@ class SmartOccupancyGridBuilder:
 grid_builder = SmartOccupancyGridBuilder(grid_size=(30,40))
 occupancy_grids = [grid_builder.depth_to_occupancy(d) for d in depth_maps]
 
+# environment
+class OfficeNavigationEnv(gym.Env):
+    def __init__(self, frames, occupancy_grids, grid_size=(30,40)):
+        super().__init__()
+        self.frames = frames
+        self.occupancy_grids = occupancy_grids
+        self.grid_size = grid_size
+        self.max_frames = len(frames)
+        self.start_pos = np.array([grid_size[0]-3, grid_size[1]//2])
+        self.goal_pos = np.array([2, grid_size[1]//2])
+        self.agent_pos = self.start_pos.copy()
+        self.current_frame = 0
+        self.max_steps = 150
+        self.current_step = 0
+        self.trajectory = []
+        self.action_space = spaces.Discrete(5)
+        obs_size = grid_size[0]*grid_size[1]+3
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.agent_pos = self.start_pos.copy()
+        self.current_frame = 0
+        self.current_step = 0
+        self.trajectory = [self.agent_pos.copy()]
+        return self._get_obs().astype(np.float32), {}
+
+    def _get_obs(self):
+        grid_flat = self.occupancy_grids[self.current_frame].flatten().astype(np.float32)
+        pos_norm = (self.agent_pos/np.array(self.grid_size)).astype(np.float32)
+        frame_progress = np.array([self.current_frame/self.max_frames], dtype=np.float32)
+        return np.concatenate([grid_flat, pos_norm, frame_progress])
+
+    def step(self, action):
+        self.current_step += 1
+        old_pos = self.agent_pos.copy()
+        move_map = {0:(-1,0), 1:(1,0), 2:(0,-1), 3:(0,1), 4:(0,0)}
+        dy, dx = move_map[action]
+        self.agent_pos = np.array([np.clip(self.agent_pos[0]+dy, 0, self.grid_size[0]-1),
+                                   np.clip(self.agent_pos[1]+dx, 0, self.grid_size[1]-1)])
+        if action in [0,1,2,3]:
+            self.current_frame = min(self.current_frame+1, self.max_frames-1)
+        self.trajectory.append(self.agent_pos.copy())
+        current_grid = self.occupancy_grids[self.current_frame]
+        hit_obstacle = current_grid[self.agent_pos[0], self.agent_pos[1]] > 0.5
+        reward = -0.1
+        terminated = False
+        truncated = False
+        if hit_obstacle:
+            reward = -15.0
+            terminated = True
+        else:
+            old_dist = np.linalg.norm(old_pos - self.goal_pos)
+            new_dist = np.linalg.norm(self.agent_pos - self.goal_pos)
+            reward += (old_dist - new_dist)*3.0
+            if new_dist < 2.5:
+                reward = 100.0
+                terminated = True
+        if self.current_step >= self.max_steps:
+            truncated = True
+        return self._get_obs().astype(np.float32), float(reward), terminated, truncated, {}
+
+env = OfficeNavigationEnv(frames, occupancy_grids)
+check_env(env)
+print("Environment ready!")
+
+# training
+model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4,
+            n_steps=1024, batch_size=64, n_epochs=10, gamma=0.99,
+            gae_lambda=0.95, clip_range=0.2, device=device)
+
+model.learn(total_timesteps=30000)
+model.save("office_navigation_agent")
+print("Training completed")
+
+def evaluate_agent(model, env, n_episodes=5):
+    results = []
+    for ep in range(n_episodes):
+        obs,_ = env.reset()
+        done = False
+        total_reward = 0
+        steps = 0
+        while not done:
+            action,_ = model.predict(obs, deterministic=True)
+            action = int(action)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            total_reward += reward
+            steps += 1
+        reached_goal = np.linalg.norm(env.agent_pos - env.goal_pos) < 3
+        results.append({'episode': ep+1,'reward': total_reward,'steps': steps,
+                        'trajectory': env.trajectory.copy(),'success': reached_goal})
+        print(f"Episode {ep+1}: Reward={total_reward:.1f}, Steps={steps}, Success={reached_goal}")
+    return results
+
+results = evaluate_agent(model, env)
+best_result = max(results, key=lambda x:x['reward'])
+print(f"Best Episode #{best_result['episode']}: Reward={best_result['reward']:.1f}, Success={best_result['success']}")
