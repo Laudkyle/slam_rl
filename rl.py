@@ -1,6 +1,3 @@
-# ============================================================================
-# SECTION 1: SETUP, INSTALLATIONS & IMPORTS
-# ============================================================================
 
 import torch
 import torch.nn as nn
@@ -79,4 +76,72 @@ try:
 except Exception:
     frames = create_demo_office_video()
     fps = 30.0
+    
+    
+# DEPTH ESTIMATION & OCCUPANCY GRIDS
+class MiDaSDepthEstimator:
+    def __init__(self, device='cuda', model_type='DPT_Large'):
+        self.device = device
+        try:
+            self.model = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True).to(device)
+            self.model.eval()
+            transforms_hub = torch.hub.load("intel-isl/MiDaS", "transforms")
+            self.transform = transforms_hub.dpt_transform
+            self.use_midas = True
+        except:
+            self.use_midas = False
+            self._init_simple_model()
+
+    def _init_simple_model(self):
+        class SimpleDepthNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = nn.Sequential(
+                    nn.Conv2d(3, 64, 7, stride=2, padding=3), nn.ReLU(),
+                    nn.Conv2d(64, 128, 5, stride=2, padding=2), nn.ReLU(),
+                    nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.ReLU())
+                self.decoder = nn.Sequential(
+                    nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.ReLU(),
+                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), nn.ReLU(),
+                    nn.ConvTranspose2d(64,1,4,stride=2,padding=1), nn.Sigmoid())
+            def forward(self,x): return self.decoder(self.encoder(x))
+        self.model = SimpleDepthNet().to(self.device).eval()
+        self.transform = transforms.Compose([transforms.ToTensor(),
+                                             transforms.Resize((256,512)),
+                                             transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
+
+    def estimate_depth(self, image):
+        if isinstance(image, np.ndarray):
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image_rgb = np.array(image)
+        with torch.no_grad():
+            if self.use_midas:
+                input_batch = self.transform(image_rgb).to(self.device)
+                prediction = self.model(input_batch)
+                prediction = F.interpolate(prediction.unsqueeze(1), size=image_rgb.shape[:2], mode="bicubic", align_corners=False).squeeze()
+                depth = prediction.cpu().numpy()
+                depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+            else:
+                img_tensor = self.transform(Image.fromarray(image_rgb)).unsqueeze(0).to(self.device)
+                depth = self.model(img_tensor).squeeze().cpu().numpy()
+        return depth
+
+depth_estimator = MiDaSDepthEstimator(device=device)
+depth_maps = [depth_estimator.estimate_depth(f) for f in frames]
+
+class SmartOccupancyGridBuilder:
+    def __init__(self, grid_size=(30,40), close_threshold=0.65):
+        self.grid_size = grid_size
+        self.close_threshold = close_threshold
+
+    def depth_to_occupancy(self, depth_map):
+        depth_resized = cv2.resize(depth_map, (self.grid_size[1], self.grid_size[0]), interpolation=cv2.INTER_NEAREST)
+        occupancy = (depth_resized > self.close_threshold).astype(np.float32)
+        floor_region = occupancy[int(self.grid_size[0]*0.7):, :]
+        floor_region *= 0.3
+        return occupancy
+
+grid_builder = SmartOccupancyGridBuilder(grid_size=(30,40))
+occupancy_grids = [grid_builder.depth_to_occupancy(d) for d in depth_maps]
 
