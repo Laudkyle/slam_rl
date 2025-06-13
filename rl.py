@@ -26,7 +26,7 @@ def upload_video_colab():
         return None
     return list(uploaded.keys())[0]
 
-def extract_frames_from_video(video_path, target_frames=200):
+def extract_frames_from_video(video_path, target_frames=40):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -69,7 +69,7 @@ def create_demo_office_video():
 try:
     video_path = upload_video_colab()
     if video_path:
-        frames, fps = extract_frames_from_video(video_path, target_frames=200)
+        frames, fps = extract_frames_from_video(video_path, target_frames=40)
     else:
         frames = create_demo_office_video()
         fps = 30.0
